@@ -48,6 +48,8 @@ def load_api_key():
     if not key and os.path.exists(path):
         with open(path, encoding="utf8") as f:
             key = f.read().strip()
+    if not key and os.environ.get("GEMINI_API_KEY"):
+        return ""
     if not key and sys.stdin and sys.stdin.isatty():
         print("\nEinmalig: Anthropic API-Schlüssel einfügen (beginnt mit sk-ant-).")
         print("Zu holen unter console.anthropic.com, Bereich API Keys.")
@@ -70,7 +72,12 @@ HOST = "0.0.0.0" if ONLINE else "127.0.0.1"
 APP_USER = os.environ.get("APP_USER", "asbest")
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "").strip()
 API_KEY = load_api_key()
-MODEL = os.environ.get("ASBEST_MODEL", "claude-sonnet-5-5")
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+PROVIDER = "gemini" if GEMINI_KEY else "claude"
+MODEL = GEMINI_MODEL if PROVIDER == "gemini" else os.environ.get("ASBEST_MODEL", "claude-sonnet-5-5")
+GEMINI_LOCK = threading.Lock()
+GEMINI_LAST = [0.0]
 BATCH = 6            # Dächer pro KI-Anfrage
 CROP_MAX_PX = 768    # max. Kantenlänge eines Dachausschnitts
 UA = "Asbest-Radar-Vorarlberg/1.0 (private Nutzung)"
@@ -289,6 +296,54 @@ Antworte NUR mit einem JSON-Array, ein Objekt pro Bild, in derselben Reihenfolge
 """
 
 
+def parse_json_array(text):
+    m = re.search(r"\[.*\]", text, re.S)
+    if not m:
+        raise RuntimeError("Antwort ohne JSON: " + text[:200])
+    return json.loads(m.group(0))
+
+
+def call_gemini(batch):
+    parts = [{"text": PROMPT}]
+    for i, (b, jpeg) in enumerate(batch, 1):
+        info = ", ".join(f"{k}={v}" for k, v in b["tags"].items()) or "keine Zusatzangaben"
+        parts.append({"text": f"Bild {i}: Grundfläche ca. {b['area']} m². OSM-Angaben: {info}"})
+        parts.append({"inline_data": {"mime_type": "image/jpeg",
+                                      "data": base64.b64encode(jpeg).decode()}})
+    body = json.dumps({
+        "contents": [{"role": "user", "parts": parts}],
+        "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"},
+    }).encode()
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    headers = {"x-goog-api-key": GEMINI_KEY, "content-type": "application/json"}
+    for attempt in range(4):
+        # Gratis-Kontingent: höchstens ca. 1 Anfrage alle 7 Sekunden
+        with GEMINI_LOCK:
+            wait = 7 - (time.time() - GEMINI_LAST[0])
+            if wait > 0:
+                time.sleep(wait)
+            GEMINI_LAST[0] = time.time()
+        try:
+            raw, _ = http_get(url, timeout=180, data=body, headers=headers)
+            break
+        except urllib.error.HTTPError as e:
+            msg = e.read().decode("utf8", "replace")[:300]
+            if e.code in (429, 500, 503) and attempt < 3:
+                time.sleep(20 * (attempt + 1))
+                continue
+            raise RuntimeError(f"Gemini Fehler {e.code}: {msg}")
+    js = json.loads(raw)
+    cands = js.get("candidates") or []
+    if not cands:
+        raise RuntimeError("Gemini lieferte keine Antwort: " + json.dumps(js)[:200])
+    text = "".join(p.get("text", "") for p in cands[0].get("content", {}).get("parts", []))
+    return parse_json_array(text)
+
+
+def call_ai(batch):
+    return call_gemini(batch) if PROVIDER == "gemini" else call_claude(batch)
+
+
 def call_claude(batch):
     content = [{"type": "text", "text": PROMPT}]
     for i, (b, jpeg) in enumerate(batch, 1):
@@ -366,7 +421,7 @@ def run_job(job_id, lat, lon, radius, limit, source_pref, label):
 
         def do_batch(bs):
             try:
-                res = call_claude([(b, crops[b["id"]][0]) for b in bs])
+                res = call_ai([(b, crops[b["id"]][0]) for b in bs])
                 for i, b in enumerate(bs, 1):
                     r = next((x for x in res if int(x.get("bild", -1)) == i), None)
                     if r is None and len(res) == len(bs):
@@ -378,7 +433,7 @@ def run_job(job_id, lat, lon, radius, limit, source_pref, label):
             with JOBS_LOCK:
                 job["analyzed"] += len(bs)
 
-        with ThreadPoolExecutor(2) as ex:
+        with ThreadPoolExecutor(1 if PROVIDER == "gemini" else 2) as ex:
             list(ex.map(do_batch, batches))
 
         feats = []
@@ -401,7 +456,7 @@ def run_job(job_id, lat, lon, radius, limit, source_pref, label):
             })
         fc = {"type": "FeatureCollection", "features": feats,
               "meta": {"ort": label, "lat": lat, "lon": lon, "radius_m": radius,
-                       "modell": MODEL, "erstellt": datetime.now().isoformat(timespec="seconds"),
+                       "modell": f"{PROVIDER}:{MODEL}", "erstellt": datetime.now().isoformat(timespec="seconds"),
                        "hinweis": "KI-Vorauswahl aus Luftbildern. Kein Nachweis von Asbest."}}
         os.makedirs(OUT_DIR, exist_ok=True)
         safe = re.sub(r"[^A-Za-z0-9äöüÄÖÜß_-]+", "_", label)[:40] or "ort"
@@ -456,7 +511,7 @@ class H(BaseHTTPRequestHandler):
             with open(os.path.join(HERE, "index.html"), "rb") as f:
                 return self.send(200, f.read(), "text/html; charset=utf-8")
         if u.path == "/api/status":
-            return self.send(200, {"api_key": bool(API_KEY), "model": MODEL})
+            return self.send(200, {"api_key": bool(API_KEY or GEMINI_KEY), "model": MODEL, "provider": PROVIDER})
         if u.path == "/api/geocode":
             try:
                 return self.send(200, geocode(qs.get("q", [""])[0]))
@@ -483,8 +538,8 @@ class H(BaseHTTPRequestHandler):
             return
         if self.path != "/api/analyze":
             return self.send(404, {"error": "nicht gefunden"})
-        if not API_KEY:
-            return self.send(400, {"error": "ANTHROPIC_API_KEY ist nicht gesetzt. Siehe Anleitung."})
+        if not (API_KEY or GEMINI_KEY):
+            return self.send(400, {"error": "Kein KI-Schlüssel gesetzt (GEMINI_API_KEY oder ANTHROPIC_API_KEY)."})
         n = int(self.headers.get("Content-Length", "0"))
         try:
             p = json.loads(self.rfile.read(n) or b"{}")
