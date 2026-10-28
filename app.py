@@ -594,6 +594,9 @@ def run_grid(job, upd, lat, lon, tiles, source_pref):
     with ThreadPoolExecutor(3) as ex:
         list(ex.map(do_crop, tiles))
     ok = [t for t in tiles if "jpeg" in t]
+    bad = [t for t in tiles if "jpeg" not in t]
+    print(f"Kacheln: {len(ok)} Bilder ok, {len(bad)} ohne Bild"
+          + (f" (z.B. {bad[0].get('error')})" if bad else ""), flush=True)
     if not ok:
         raise RuntimeError("Keine Luftbild-Kachel ladbar: " + (tiles[0].get("error") or ""))
 
@@ -912,6 +915,39 @@ class H(BaseHTTPRequestHandler):
         self.send(200, {"job": job_id})
 
 
+def selftest():
+    """Einmaliger Live-Test beim Start (nur wenn SELFTEST=1 gesetzt). Ergebnis steht im Log."""
+    time.sleep(3)
+    print("SELBSTTEST Start", flush=True)
+    t0 = time.time()
+    try:
+        hits = geocode("Rheinstr 57 Hard")
+        print(f"SELBSTTEST Ortssuche: {len(hits)} Treffer in {time.time() - t0:.1f}s", flush=True)
+        for h in hits[:4]:
+            print(f"SELBSTTEST   {h['quelle']}: {h['name']} ({h['lat']:.5f}, {h['lon']:.5f})", flush=True)
+    except Exception as e:
+        print("SELBSTTEST Ortssuche FEHLER:", e, flush=True)
+        hits = []
+    lat, lon = (hits[0]["lat"], hits[0]["lon"]) if hits else (47.4927, 9.6842)
+    d_lat, d_lon = 0.0007, 0.0011          # ca. 155 x 165 m -> 4 bis 6 Kacheln
+    bbox = (lat - d_lat, lon - d_lon, lat + d_lat, lon + d_lon)
+    JOBS["selftest"] = {"phase": "Start", "done": False, "total": 0, "total_found": 0,
+                        "cropped": 0, "analyzed": 0, "started": time.time()}
+    t1 = time.time()
+    run_job("selftest", lat, lon, 250, 60, "vogis", "Selbsttest", bbox)
+    j = JOBS["selftest"]
+    if j.get("error"):
+        print("SELBSTTEST Analyse FEHLER:", j["error"], flush=True)
+        return
+    m = j["result"]["meta"]
+    print(f"SELBSTTEST Analyse fertig in {time.time() - t1:.0f}s: {m.get('kacheln')} Kacheln ok, "
+          f"{m.get('kachel_fehler')} mit Fehler, {len(j['result']['features'])} Verdachtsflächen, "
+          f"Modell {m.get('modell')}", flush=True)
+    for f in j["result"]["features"][:5]:
+        p = f["properties"]
+        print(f"SELBSTTEST   {p['stufe']}: {p['dacheindeckung']} | {p['begruendung']} | Quelle {p['bildquelle']}", flush=True)
+
+
 if __name__ == "__main__":
     if not API_KEY:
         print("Achtung: ANTHROPIC_API_KEY ist nicht gesetzt. Die Karte läuft, die KI-Analyse nicht.")
@@ -930,4 +966,6 @@ if __name__ == "__main__":
         print("Dieses Fenster offen lassen. Beenden mit Strg+C.")
         import webbrowser
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+    if os.environ.get("SELFTEST") == "1":
+        threading.Thread(target=selftest, daemon=True).start()
     srv.serve_forever()
