@@ -86,7 +86,10 @@ OUT_DIR = os.path.join(HERE, "ergebnisse")
 # Bildquellen (in dieser Reihenfolge versucht)
 VOGIS_WMS = "https://vogis.cnv.at/geoserver/vogis/ef2022_10cm/wms"
 VOGIS_LAYER = "ef2022_10cm"
-BASEMAP_TILE = "https://maps{s}.wien.gv.at/basemap/bmaporthofoto30cm/normal/google3857/{z}/{y}/{x}.jpeg"
+BASEMAP_HOSTS = ["maps.wien.gv.at", "mapsneu.wien.gv.at", "maps1.wien.gv.at", "maps2.wien.gv.at"]
+BASEMAP_PATH = "/basemap/bmaporthofoto30cm/normal/google3857/{z}/{y}/{x}.jpeg"
+BASEMAP_OK = [0]   # Index des zuletzt funktionierenden Hosts
+VOGIS_SEM = threading.Semaphore(2)   # Landesserver schonen
 
 # Grobe Begrenzung Vorarlberg (WGS84) für die Ortssuche
 VBG_VIEWBOX = "9.50,47.62,10.25,46.82"   # lon_min,lat_max,lon_max,lat_min
@@ -232,7 +235,17 @@ def crop_from_wms(bbox):
         "BBOX": f"{minx},{miny},{maxx},{maxy}",
         "WIDTH": px, "HEIGHT": px, "FORMAT": "image/jpeg",
     })
-    raw, ctype = http_get(VOGIS_WMS + "?" + params, timeout=40)
+    last = None
+    for attempt in range(3):
+        try:
+            with VOGIS_SEM:
+                raw, ctype = http_get(VOGIS_WMS + "?" + params, timeout=40)
+            break
+        except Exception as e:
+            last = e
+            time.sleep(2 + attempt * 3)
+    else:
+        raise RuntimeError(f"Landesserver nicht erreichbar ({last})")
     if "image" not in ctype:
         raise RuntimeError("WMS lieferte kein Bild: " + raw[:200].decode("utf8", "replace"))
     return Image.open(io.BytesIO(raw)).convert("RGB")
@@ -252,8 +265,17 @@ def crop_from_basemap(bbox, z=19):
     canvas = Image.new("RGB", ((tx1 - tx0 + 1) * 256, (ty1 - ty0 + 1) * 256))
     for tx in range(tx0, tx1 + 1):
         for ty in range(ty0, ty1 + 1):
-            url = BASEMAP_TILE.format(s=1 + (tx + ty) % 4, z=z, y=ty, x=tx)
-            raw, _ = http_get(url, timeout=30)
+            raw, last = None, None
+            for k in range(len(BASEMAP_HOSTS)):
+                host = BASEMAP_HOSTS[(BASEMAP_OK[0] + k) % len(BASEMAP_HOSTS)]
+                try:
+                    raw, _ = http_get("https://" + host + BASEMAP_PATH.format(z=z, y=ty, x=tx), timeout=30)
+                    BASEMAP_OK[0] = BASEMAP_HOSTS.index(host)
+                    break
+                except Exception as e:
+                    last = e
+            if raw is None:
+                raise RuntimeError(f"basemap.at nicht erreichbar ({last})")
             canvas.paste(Image.open(io.BytesIO(raw)).convert("RGB"),
                          ((tx - tx0) * 256, (ty - ty0) * 256))
     left, top = x0 - tx0 * 256, y0 - ty0 * 256
@@ -446,7 +468,7 @@ def run_grid(job, upd, lat, lon, radius, source_pref):
         with JOBS_LOCK:
             job["cropped"] += 1
 
-    with ThreadPoolExecutor(4) as ex:
+    with ThreadPoolExecutor(3) as ex:
         list(ex.map(do_crop, tiles))
     ok = [t for t in tiles if "jpeg" in t]
     if not ok:
@@ -559,11 +581,12 @@ def run_job(job_id, lat, lon, radius, limit, source_pref, label):
             with JOBS_LOCK:
                 job["cropped"] += 1
 
-        with ThreadPoolExecutor(4) as ex:
+        with ThreadPoolExecutor(3) as ex:
             list(ex.map(do_crop, buildings))
         job["images"] = {k: v[0] for k, v in crops.items()}
 
         ok = [b for b in buildings if b["id"] in crops]
+        print(f"Bilder: {len(ok)} ok, {len(buildings) - len(ok)} Fehler", flush=True)
         if not ok:
             raise RuntimeError("Kein einziges Luftbild konnte geladen werden. "
                                + (buildings[0].get("error") or ""))

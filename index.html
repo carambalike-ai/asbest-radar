@@ -112,8 +112,7 @@ const map = L.map('map',{maxZoom:22,zoomControl:true}).setView([47.48,9.67],16);
 const vogis = L.tileLayer.wms('https://vogis.cnv.at/geoserver/vogis/ef2022_10cm/wms',{
   layers:'ef2022_10cm',format:'image/jpeg',version:'1.1.1',maxZoom:22,tileSize:512,
   attribution:'Orthofoto 2022 © Land Vorarlberg, CC BY 4.0'}).addTo(map);
-const basemap = L.tileLayer('https://maps{s}.wien.gv.at/basemap/bmaporthofoto30cm/normal/google3857/{z}/{y}/{x}.jpeg',{
-  subdomains:['1','2','3','4'],maxNativeZoom:19,maxZoom:22,attribution:'© basemap.at'});
+const basemap = L.tileLayer('https://maps.wien.gv.at/basemap/bmaporthofoto30cm/normal/google3857/{z}/{y}/{x}.jpeg',{maxNativeZoom:19,maxZoom:22,attribution:'© basemap.at'});
 L.control.layers({'Land Vorarlberg 2022 (10 cm)':vogis,'basemap.at Orthofoto':basemap}).addTo(map);
 L.control.scale({imperial:false}).addTo(map);
 let tileErr=0; vogis.on('tileerror',()=>{ if(++tileErr===6) setStatus('Das Landes-Luftbild lädt nicht. Oben rechts auf basemap.at umschalten.'); });
