@@ -37,7 +37,10 @@ main{display:grid;grid-template-columns:1fr minmax(320px,420px);min-height:0}
 aside{border-left:1px solid var(--line);display:grid;grid-template-rows:auto auto 1fr auto;min-height:0;background:var(--panel)}
 .box{padding:12px 16px;border-bottom:1px solid var(--line)}
 #hits{display:grid;gap:4px}
-#hits button{text-align:left;background:transparent;color:var(--ink);border:1px solid var(--line);font-size:.85rem}
+#hits button{text-align:left;background:transparent;color:var(--ink);border:1px solid var(--line);font-size:.85rem;line-height:1.35}
+#hits button.on{border-color:var(--ink);box-shadow:inset 3px 0 0 var(--ink)}
+#hits button small{display:block;font:400 .68rem var(--mono);color:var(--mute);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#viewInfo{margin-top:4px}
 .status{font:400 .8rem var(--mono);color:var(--mute);line-height:1.5}
 .bar{height:3px;background:var(--line);margin-top:8px}
 .bar i{display:block;height:100%;width:0;background:var(--ink);transition:width .3s}
@@ -82,14 +85,16 @@ footer{padding:10px 16px;display:flex;gap:8px;flex-wrap:wrap;border-top:1px soli
     <label>Bildquelle<select id="source">
       <option value="vogis" selected>Land Vbg. 2022</option><option value="basemap">basemap.at</option></select></label>
     <button type="submit">Suchen</button>
-    <button type="button" id="run" disabled>Dächer analysieren</button>
+    <button type="button" id="run" class="ghost" disabled title="Gebäude im Umkreis um den Suchtreffer">Umkreis analysieren</button>
+    <button type="button" id="runView" disabled title="Genau den sichtbaren Kartenausschnitt durchsuchen">Ausschnitt analysieren</button>
   </form>
 </header>
 <main>
   <div id="map"></div>
   <aside>
     <div class="box"><div id="hits"></div>
-      <div class="status" id="status">Ort eingeben, Treffer wählen, dann analysieren. Ohne Suche wird die Kartenmitte verwendet.</div>
+      <div class="status" id="status">Ort suchen oder einfach auf der Karte hinzoomen. „Ausschnitt analysieren“ durchsucht genau das, was du gerade siehst.</div>
+      <div class="status" id="viewInfo"></div>
       <div class="bar"><i id="prog"></i></div></div>
     <div class="box counts" id="counts"></div>
     <div id="list"><div class="empty">Hier erscheinen die Dächer, sortiert nach Verdachtsgrad. Jedes mit Luftbild-Ausschnitt, den Merkmalen und deiner eigenen Bewertung.</div></div>
@@ -129,7 +134,7 @@ if (location.protocol === 'file:') {
   document.querySelectorAll('#f button').forEach(b => b.disabled = true);
 } else {
   fetch('/api/status').then(r=>r.json()).then(s=>{
-    $('run').disabled=false;
+    serverOk=true; $('run').disabled=false; updateViewInfo();
     if(!s.api_key) setStatus('Kein API-Schlüssel gesetzt. Karte geht, die Analyse nicht. Siehe Anleitung.');
   }).catch(()=>setStatus(NO_SERVER));
 }
@@ -140,46 +145,76 @@ $('f').onsubmit = async e => {
     const r = await fetch('/api/geocode?q='+encodeURIComponent($('q').value)); const hits = await r.json();
     if(!r.ok) throw new Error(hits.error);
     if(!hits.length){ setStatus('Nichts in Vorarlberg gefunden. Anders schreiben, z.B. Straße und Gemeinde.'); return; }
-    hits.forEach((h,i)=>{ const b=document.createElement('button'); b.textContent=h.name.split(',').slice(0,3).join(','); b.onclick=()=>pick(h); $('hits').append(b); if(i===0) pick(h); });
-    setStatus(hits.length+' Treffer. Ersten gewählt. Dann „Dächer analysieren“.');
+    hits.forEach((h,i)=>{ const b=document.createElement('button'); b.type='button';
+      b.innerHTML=esc(h.name)+'<small>'+esc(h.full||'')+'</small>';
+      b.onclick=()=>{ document.querySelectorAll('#hits button').forEach(x=>x.classList.remove('on')); b.classList.add('on'); pick(h); };
+      $('hits').append(b); if(i===0) b.click(); });
+    setStatus(hits.length>1?hits.length+' Treffer, der erste ist gewählt. Passt er nicht, anderen anklicken.':'Gefunden.');
   }catch(err){ setStatus(netMsg(err)); }
 };
-function pick(h){ center={lat:h.lat,lon:h.lon}; label=h.name.split(',')[0]; map.setView([h.lat,h.lon],18); drawCircle(); }
+function pick(h){ center={lat:h.lat,lon:h.lon}; label=h.name.split(',')[0];
+  const bb=h.bbox||[];
+  if(!h.adresse && bb.length===4 && (bb[1]-bb[0])>0.0015){ map.fitBounds([[bb[0],bb[2]],[bb[1],bb[3]]],{maxZoom:18}); }
+  else map.setView([h.lat,h.lon],19);
+  drawCircle(); }
 function drawCircle(){ const c=center||map.getCenter(); if(circle) map.removeLayer(circle);
   circle=L.circle([c.lat,c.lon||c.lng],{radius:+$('radius').value,color:getComputedStyle(document.documentElement).getPropertyValue('--ink'),weight:1,dashArray:'4 4',fill:false}).addTo(map); }
 $('radius').onchange=drawCircle;
 
+const TILE_M=80, TILE_MAX=80;
+function viewTiles(){ const b=map.getBounds(), c=b.getCenter();
+  const w=map.distance([c.lat,b.getWest()],[c.lat,b.getEast()]), h=map.distance([b.getSouth(),c.lng],[b.getNorth(),c.lng]);
+  return {b,w,h,n:Math.max(1,Math.ceil(w/TILE_M))*Math.max(1,Math.ceil(h/TILE_M))}; }
+function fmtMin(s){ return s<90?'ca. 1 min':'ca. '+Math.round(s/60)+' min'; }
+function updateViewInfo(){ const v=viewTiles(), km=(v.w*v.h/1e6);
+  const txt=`Ausschnitt ${Math.round(v.w)} × ${Math.round(v.h)} m · ${v.n} Kacheln`;
+  if(v.n>TILE_MAX){ $('viewInfo').textContent=txt+' · zu groß, bitte näher hineinzoomen'; $('runView').disabled=true; }
+  else { $('viewInfo').textContent=txt+' · Dauer '+fmtMin(15+v.n*3.5); $('runView').disabled=!serverOk||busy; } }
+let serverOk=false, busy=false, viewRect=null;
+map.on('moveend zoomend',updateViewInfo);
+$('runView').onclick = async () => {
+  const v=viewTiles(); if(v.n>TILE_MAX) return;
+  if(circle){ map.removeLayer(circle); circle=null; }
+  if(viewRect) map.removeLayer(viewRect);
+  viewRect=L.rectangle(v.b,{color:getComputedStyle(document.documentElement).getPropertyValue('--ink'),weight:1,dashArray:'4 4',fill:false,interactive:false}).addTo(map);
+  start({bbox:[v.b.getSouth(),v.b.getWest(),v.b.getNorth(),v.b.getEast()],source:$('source').value,label:'Kartenausschnitt'});
+};
+async function start(body){
+  busy=true; $('run').disabled=$('runView').disabled=true; setStatus('Auftrag gestartet …'); $('prog').style.width='2%';
+  try{
+    const r = await fetch('/api/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const js = await r.json(); if(!r.ok) throw new Error(js.error);
+    job = js.job; poll();
+  }catch(err){ setStatus(netMsg(err)); done(); }
+}
+function done(){ busy=false; $('run').disabled=!serverOk; updateViewInfo(); }
 $('run').onclick = async () => {
   const c = center || {lat:map.getCenter().lat, lon:map.getCenter().lng};
   if(!center){ label='Kartenmitte'; drawCircle(); }
-  $('run').disabled=true; setStatus('Auftrag gestartet …'); $('prog').style.width='2%';
-  try{
-    const r = await fetch('/api/analyze',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({lat:c.lat,lon:c.lon,radius:+$('radius').value,max:+$('max').value,source:$('source').value,label})});
-    const js = await r.json(); if(!r.ok) throw new Error(js.error);
-    job = js.job; poll();
-  }catch(err){ setStatus(netMsg(err)); $('run').disabled=false; }
+  if(viewRect){ map.removeLayer(viewRect); viewRect=null; }
+  start({lat:c.lat,lon:c.lon,radius:+$('radius').value,max:+$('max').value,source:$('source').value,label});
 };
 
 async function poll(){
   let r, j;
   try{ r = await fetch('/api/job/'+job); j = await r.json(); }
-  catch(err){ setStatus(netMsg(err)); $('run').disabled=false; return; }
+  catch(err){ setStatus(netMsg(err)); done(); return; }
   const t = j.total||0, secs = Math.round((Date.now()/1000)-j.started);
   let pct = 3;
   if(t){ pct = 5 + 35*(j.cropped/t) + 60*(j.analyzed/Math.max(1,t)); }
   $('prog').style.width = Math.min(100,pct)+'%';
   let rest='';
-  if(j.phase==='KI bewertet Dächer' && j.analyzed>0){ const per=secs/j.analyzed; rest=' · noch ca. '+Math.max(1,Math.round(per*(t-j.analyzed)/60))+' min'; }
-  setStatus(`${j.phase} · ${j.cropped}/${t} Bilder · ${j.analyzed}/${t} bewertet · ${secs}s${rest}` + (j.total_found>t?` · ${j.total_found} Gebäude im Umkreis, die nächsten ${t} genommen`:''));
+  if((j.phase==='KI bewertet Dächer'||j.phase==='KI durchsucht Kacheln') && j.analyzed>0){ const per=secs/j.analyzed; rest=' · noch ca. '+Math.max(1,Math.round(per*(t-j.analyzed)/60))+' min'; }
+  setStatus(`${j.phase} · ${j.cropped}/${t} Bilder · ${j.analyzed}/${t} geprüft · ${secs}s${rest}` + (j.total_found>t?` · ${j.total_found} Gebäude im Umkreis, die nächsten ${t} genommen`:''));
   if(!j.done) return setTimeout(poll,1500);
-  $('run').disabled=false;
+  done();
   if(j.error){ setStatus('Fehler: '+j.error); return; }
   if(!j.result){ setStatus('Keine Gebäude im Umkreis gefunden.'); return; }
   $('prog').style.width='100%';
   const m=j.result.meta||{};
   if(m.modus==='kachel'){
-    setStatus(`Fertig in ${secs}s · Kachel-Suche (keine Gebäudedaten verfügbar) · ${m.kacheln} Kacheln à 80 m durchsucht · ${j.result.features.length} Verdachtsflächen`+(m.kachel_fehler?` · ${m.kachel_fehler} Kacheln mit Fehler`:''));
+    const why = m.grund==='ausschnitt' ? 'Kartenausschnitt' : 'Kachel-Suche (Gebäudedaten nicht erreichbar)';
+    setStatus(`Fertig in ${secs}s · ${why} · ${m.kacheln} Kacheln à 80 m durchsucht · ${j.result.features.length} Verdachtsflächen`+(m.kachel_fehler?` · ${m.kachel_fehler} Kacheln mit Fehler`:''));
   } else setStatus(`Fertig in ${secs}s · ${t} Dächer`);
   data=j.result; render();
   if(!data.features.length) $('list').innerHTML='<div class="empty">Keine verdächtigen Dächer gefunden.</div>';

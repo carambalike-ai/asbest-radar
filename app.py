@@ -152,20 +152,100 @@ def http_get(url, timeout=40, data=None, headers=None):
 
 
 # ------------------------------------------------------------------ Ortssuche
-def geocode(q):
+VBG_BOUNDS = (9.50, 46.82, 10.25, 47.62)   # lon_min, lat_min, lon_max, lat_max
+
+
+def in_vbg(lat, lon):
+    return VBG_BOUNDS[1] <= lat <= VBG_BOUNDS[3] and VBG_BOUNDS[0] <= lon <= VBG_BOUNDS[2]
+
+
+def normalize_query(q):
+    q = " ".join(q.replace(";", ",").split())
+    q = re.sub(r"(?i)str\.(?=\s|,|\d|$)", "straße", q)
+    q = re.sub(r"(?i)(?<=\w)str(?=\s+\d)", "straße", q)
+    q = re.sub(r"(?i)strasse\b", "straße", q)
+    q = re.sub(r"(?i)\bg\.(?=\s|,|$)", "gasse", q)
+    return q
+
+
+def geo_nominatim(q):
     params = urllib.parse.urlencode({
-        "q": q, "format": "jsonv2", "limit": 6, "countrycodes": "at",
+        "q": q, "format": "jsonv2", "limit": 8, "countrycodes": "at", "addressdetails": 1,
         "viewbox": VBG_VIEWBOX, "bounded": 1, "accept-language": "de",
     })
-    raw, _ = http_get("https://nominatim.openstreetmap.org/search?" + params)
+    raw, _ = http_get("https://nominatim.openstreetmap.org/search?" + params, timeout=12)
     out = []
     for r in json.loads(raw):
-        out.append({
-            "name": r.get("display_name", ""),
-            "lat": float(r["lat"]), "lon": float(r["lon"]),
-            "bbox": [float(v) for v in r.get("boundingbox", [])],
-        })
+        a = r.get("address", {})
+        street = " ".join(x for x in (a.get("road"), a.get("house_number")) if x)
+        town = a.get("village") or a.get("town") or a.get("city") or a.get("municipality") or ""
+        short = ", ".join(x for x in (r.get("name") if not street else "", street, town) if x)
+        bb = [float(v) for v in r.get("boundingbox", [])]   # lat_min, lat_max, lon_min, lon_max
+        out.append({"name": short or r.get("display_name", ""), "full": r.get("display_name", ""),
+                    "lat": float(r["lat"]), "lon": float(r["lon"]),
+                    "bbox": bb, "adresse": bool(a.get("house_number")), "quelle": "nominatim"})
     return out
+
+
+def geo_photon(q):
+    params = urllib.parse.urlencode({
+        "q": q, "limit": 8, "lang": "de",
+        "bbox": ",".join(str(v) for v in VBG_BOUNDS),
+    })
+    raw, _ = http_get("https://photon.komoot.io/api/?" + params, timeout=12)
+    out = []
+    for f in json.loads(raw).get("features", []):
+        p = f.get("properties", {})
+        lon, lat = f["geometry"]["coordinates"][:2]
+        if p.get("state") and "Vorarlberg" not in p.get("state", ""):
+            continue
+        street = " ".join(str(x) for x in (p.get("street"), p.get("housenumber")) if x)
+        town = p.get("city") or p.get("district") or p.get("county") or ""
+        name = p.get("name") if p.get("name") and p.get("name") != street else ""
+        short = ", ".join(x for x in (name, street, town) if x)
+        ext = p.get("extent")          # lon_min, lat_max, lon_max, lat_min
+        bb = [ext[3], ext[1], ext[0], ext[2]] if ext and len(ext) == 4 else []
+        out.append({"name": short or name or "Treffer", "full": short,
+                    "lat": float(lat), "lon": float(lon), "bbox": bb,
+                    "adresse": bool(p.get("housenumber")), "quelle": "photon"})
+    return out
+
+
+def geocode(q):
+    q = normalize_query(q)
+    # Koordinaten direkt, z.B. "47.4935, 9.6880"
+    m = re.match(r"^\s*(4[67]\.\d+)\s*[,; ]\s*(9\.\d+|10\.\d+)\s*$", q)
+    if m:
+        lat, lon = float(m.group(1)), float(m.group(2))
+        return [{"name": f"{lat:.5f}, {lon:.5f}", "full": "Koordinate", "lat": lat, "lon": lon,
+                 "bbox": [], "adresse": True, "quelle": "eingabe"}]
+
+    results, errors = [], []
+
+    def run(fn):
+        try:
+            results.extend(fn(q))
+        except Exception as e:
+            errors.append(f"{fn.__name__}: {e}")
+
+    ts = [threading.Thread(target=run, args=(fn,)) for fn in (geo_nominatim, geo_photon)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    if not results and errors:
+        raise RuntimeError(" | ".join(errors))
+
+    # Doppelte (unter 40 m Abstand, gleicher Name) zusammenführen, Adressen mit Hausnummer zuerst
+    out = []
+    for r in results:
+        if not in_vbg(r["lat"], r["lon"]):
+            continue
+        dup = next((o for o in out if abs(o["lat"] - r["lat"]) < 0.0004 and abs(o["lon"] - r["lon"]) < 0.0006), None)
+        if dup:
+            continue
+        out.append(r)
+    want_nr = bool(re.search(r"\d", q))
+    out.sort(key=lambda r: (not (r["adresse"] and want_nr), r["quelle"] != "nominatim"))
+    return out[:8]
 
 
 # ---------------------------------------------------------------- Gebäude (OSM)
@@ -449,7 +529,10 @@ GRID_TILE_M = 80
 GRID_BATCH = 4
 
 
-def run_grid(job, upd, lat, lon, radius, source_pref):
+GRID_MAX = 80
+
+
+def tiles_for_circle(lat, lon, radius):
     cx, cy = to_3857(lon, lat)
     mpu = meters_per_unit(lat)
     side = GRID_TILE_M / mpu
@@ -464,7 +547,35 @@ def run_grid(job, upd, lat, lon, radius, source_pref):
                 tiles.append({"id": f"k{i}_{j}", "dist": d,
                               "bbox": (tx - side / 2, ty - side / 2, tx + side / 2, ty + side / 2)})
     tiles.sort(key=lambda t: t["dist"])
-    tiles = tiles[:80]
+    return tiles[:GRID_MAX]
+
+
+def tiles_for_bbox(south, west, north, east):
+    """Kacheln à 80 m, die den sichtbaren Kartenausschnitt lückenlos abdecken."""
+    x0, y0 = to_3857(west, south)
+    x1, y1 = to_3857(east, north)
+    lat = (south + north) / 2
+    mpu = meters_per_unit(lat)
+    side = GRID_TILE_M / mpu
+    nx = max(1, math.ceil((x1 - x0) / side))
+    ny = max(1, math.ceil((y1 - y0) / side))
+    # Raster mittig über den Ausschnitt legen
+    ox = x0 - (nx * side - (x1 - x0)) / 2
+    oy = y0 - (ny * side - (y1 - y0)) / 2
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+    tiles = []
+    for i in range(nx):
+        for j in range(ny):
+            bx, by = ox + i * side, oy + j * side
+            d = math.hypot(bx + side / 2 - cx, by + side / 2 - cy) * mpu
+            tiles.append({"id": f"k{i}_{j}", "dist": d, "bbox": (bx, by, bx + side, by + side)})
+    tiles.sort(key=lambda t: t["dist"])
+    return tiles
+
+
+def run_grid(job, upd, lat, lon, tiles, source_pref):
+    cx, cy = to_3857(lon, lat)
+    mpu = meters_per_unit(lat)
     upd(phase="Luftbild-Kacheln laden", total=len(tiles), total_found=len(tiles))
 
     def do_crop(t):
@@ -555,7 +666,7 @@ def run_grid(job, upd, lat, lon, radius, source_pref):
 
 
 # ----------------------------------------------------------------------- Job
-def run_job(job_id, lat, lon, radius, limit, source_pref, label):
+def run_job(job_id, lat, lon, radius, limit, source_pref, label, bbox=None):
     job = JOBS[job_id]
 
     def upd(**kw):
@@ -563,14 +674,23 @@ def run_job(job_id, lat, lon, radius, limit, source_pref, label):
             job.update(kw)
 
     try:
-        upd(phase="Gebäude laden")
-        try:
-            buildings, total = load_buildings(lat, lon, radius, limit)
-        except Exception as e:
-            print("Wechsel auf Kachel-Suche:", e, flush=True)
-            feats, n_ok, n_err = run_grid(job, upd, lat, lon, radius, source_pref)
+        grid_reason = None
+        if bbox:
+            tiles = tiles_for_bbox(*bbox)
+            grid_reason = "ausschnitt"
+        else:
+            upd(phase="Gebäude laden")
+            try:
+                buildings, total = load_buildings(lat, lon, radius, limit)
+            except Exception as e:
+                print("Wechsel auf Kachel-Suche:", e, flush=True)
+                tiles = tiles_for_circle(lat, lon, radius)
+                grid_reason = "keine_gebaeudedaten"
+        if grid_reason:
+            feats, n_ok, n_err = run_grid(job, upd, lat, lon, tiles, source_pref)
             fc = {"type": "FeatureCollection", "features": feats,
                   "meta": {"ort": label, "lat": lat, "lon": lon, "radius_m": radius, "modus": "kachel",
+                           "grund": grid_reason, "ausschnitt": bbox,
                            "kacheln": n_ok, "kachel_fehler": n_err,
                            "modell": f"{PROVIDER}:{GEMINI_ACTIVE[0] if PROVIDER == 'gemini' else MODEL}", "erstellt": datetime.now().isoformat(timespec="seconds"),
                            "hinweis": "KI-Vorauswahl aus Luftbildern. Kein Nachweis von Asbest."}}
@@ -761,11 +881,26 @@ class H(BaseHTTPRequestHandler):
         if not (API_KEY or GEMINI_KEY):
             return self.send(400, {"error": "Kein KI-Schlüssel gesetzt (GEMINI_API_KEY oder ANTHROPIC_API_KEY)."})
         n = int(self.headers.get("Content-Length", "0"))
+        bbox = None
         try:
             p = json.loads(self.rfile.read(n) or b"{}")
-            lat, lon = float(p["lat"]), float(p["lon"])
+            if p.get("bbox"):
+                s, w, nn, e = [float(v) for v in p["bbox"]]
+                if not (s < nn and w < e):
+                    raise ValueError
+                bbox = (s, w, nn, e)
+                lat, lon = (s + nn) / 2, (w + e) / 2
+            else:
+                lat, lon = float(p["lat"]), float(p["lon"])
         except Exception:
             return self.send(400, {"error": "Ungültige Anfrage"})
+        if not in_vbg(lat, lon):
+            return self.send(400, {"error": "Der Ausschnitt liegt nicht in Vorarlberg."})
+        if bbox:
+            n_tiles = len(tiles_for_bbox(*bbox))
+            if n_tiles > GRID_MAX:
+                return self.send(400, {"error": f"Ausschnitt zu groß ({n_tiles} Kacheln à 80 m, "
+                                                f"max. {GRID_MAX}). Bitte näher hineinzoomen."})
         radius = max(50, min(1500, int(p.get("radius", 250))))
         limit = max(1, min(400, int(p.get("max", 60))))
         job_id = str(uuid.uuid4())
@@ -773,7 +908,7 @@ class H(BaseHTTPRequestHandler):
                         "cropped": 0, "analyzed": 0, "started": time.time()}
         threading.Thread(target=run_job, daemon=True, args=(
             job_id, lat, lon, radius, limit, p.get("source", "vogis"),
-            p.get("label", "Ort"))).start()
+            p.get("label", "Ort"), bbox)).start()
         self.send(200, {"job": job_id})
 
 
