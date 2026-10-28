@@ -73,7 +73,8 @@ APP_USER = os.environ.get("APP_USER", "asbest")
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "").strip()
 API_KEY = load_api_key()
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_ACTIVE = [GEMINI_MODEL]   # wird bei "Modell nicht mehr verfügbar" automatisch ersetzt
 PROVIDER = "gemini" if GEMINI_KEY else "claude"
 MODEL = GEMINI_MODEL if PROVIDER == "gemini" else os.environ.get("ASBEST_MODEL", "claude-sonnet-5-5")
 GEMINI_LOCK = threading.Lock()
@@ -346,9 +347,10 @@ def call_gemini(prompt, items):
         "contents": [{"role": "user", "parts": parts}],
         "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"},
     }).encode()
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
     headers = {"x-goog-api-key": GEMINI_KEY, "content-type": "application/json"}
-    for attempt in range(4):
+    tried = set()
+    for attempt in range(6):
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_ACTIVE[0]}:generateContent"
         # Gratis-Kontingent: höchstens ca. 1 Anfrage alle 7 Sekunden
         with GEMINI_LOCK:
             wait = 7 - (time.time() - GEMINI_LAST[0])
@@ -359,8 +361,18 @@ def call_gemini(prompt, items):
             raw, _ = http_get(url, timeout=180, data=body, headers=headers)
             break
         except urllib.error.HTTPError as e:
-            msg = e.read().decode("utf8", "replace")[:300]
-            if e.code in (429, 500, 503) and attempt < 3:
+            msg = e.read().decode("utf8", "replace")[:800]
+            if e.code == 404:
+                tried.add(GEMINI_ACTIVE[0])
+                m = re.search(r"models/(gemini[\w.\-]+)", msg.split("use", 1)[-1])
+                cand = [m.group(1)] if m else []
+                cand += ["gemini-flash-latest", "gemini-3.8-flash"]
+                nxt = next((c for c in cand if c not in tried), None)
+                if nxt:
+                    print(f"Gemini-Modell {GEMINI_ACTIVE[0]} nicht verfügbar, wechsle auf {nxt}", flush=True)
+                    GEMINI_ACTIVE[0] = nxt
+                    continue
+            if e.code in (429, 500, 503) and attempt < 4:
                 time.sleep(20 * (attempt + 1))
                 continue
             raise RuntimeError(f"Gemini Fehler {e.code}: {msg}")
@@ -560,7 +572,7 @@ def run_job(job_id, lat, lon, radius, limit, source_pref, label):
             fc = {"type": "FeatureCollection", "features": feats,
                   "meta": {"ort": label, "lat": lat, "lon": lon, "radius_m": radius, "modus": "kachel",
                            "kacheln": n_ok, "kachel_fehler": n_err,
-                           "modell": f"{PROVIDER}:{MODEL}", "erstellt": datetime.now().isoformat(timespec="seconds"),
+                           "modell": f"{PROVIDER}:{GEMINI_ACTIVE[0] if PROVIDER == 'gemini' else MODEL}", "erstellt": datetime.now().isoformat(timespec="seconds"),
                            "hinweis": "KI-Vorauswahl aus Luftbildern. Kein Nachweis von Asbest."}}
             upd(phase="fertig", done=True, result=fc, saved="", mode="kachel")
             return
@@ -663,7 +675,7 @@ def run_job(job_id, lat, lon, radius, limit, source_pref, label):
             })
         fc = {"type": "FeatureCollection", "features": feats,
               "meta": {"ort": label, "lat": lat, "lon": lon, "radius_m": radius,
-                       "modell": f"{PROVIDER}:{MODEL}", "erstellt": datetime.now().isoformat(timespec="seconds"),
+                       "modell": f"{PROVIDER}:{GEMINI_ACTIVE[0] if PROVIDER == 'gemini' else MODEL}", "erstellt": datetime.now().isoformat(timespec="seconds"),
                        "hinweis": "KI-Vorauswahl aus Luftbildern. Kein Nachweis von Asbest."}}
         os.makedirs(OUT_DIR, exist_ok=True)
         safe = re.sub(r"[^A-Za-z0-9äöüÄÖÜß_-]+", "_", label)[:40] or "ort"
