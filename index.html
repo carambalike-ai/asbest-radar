@@ -48,7 +48,12 @@ aside{border-left:1px solid var(--line);display:grid;grid-template-rows:auto aut
 #list{overflow:auto;min-height:0}
 .item{display:grid;grid-template-columns:88px 1fr;gap:12px;padding:12px 16px;border-bottom:1px solid var(--line);cursor:pointer}
 .item:hover,.item.sel{background:color-mix(in srgb,var(--ink) 5%,transparent)}
-.item img{width:88px;height:88px;object-fit:cover;background:var(--line)}
+.item img{width:88px;height:88px;object-fit:cover;background:var(--line);cursor:zoom-in}
+#lb{position:fixed;inset:0;background:rgba(0,0,0,.85);display:grid;place-items:center;z-index:2000;padding:20px;cursor:zoom-out}
+#lb figure{margin:0;max-width:min(92vw,820px);display:grid;gap:10px}
+#lb img{width:100%;height:auto;max-height:78vh;object-fit:contain;background:#222}
+#lb figcaption{color:#eee;font-size:.9rem;line-height:1.45}
+#lb .k{display:inline-block;width:12px;height:12px;vertical-align:-1px;margin:0 4px 0 10px}
 .item h3{margin:0 0 3px;font-size:.95rem;font-weight:600;display:flex;gap:8px;align-items:center}
 .item p{margin:0;font-size:.85rem;line-height:1.45;color:var(--ink)}
 .item .meta{font:400 .7rem var(--mono);color:var(--mute);margin-top:4px}
@@ -113,7 +118,7 @@ L.control.layers({'Land Vorarlberg 2022 (10 cm)':vogis,'basemap.at Orthofoto':ba
 L.control.scale({imperial:false}).addTo(map);
 let tileErr=0; vogis.on('tileerror',()=>{ if(++tileErr===6) setStatus('Das Landes-Luftbild lädt nicht. Oben rechts auf basemap.at umschalten.'); });
 
-let center=null, label='Kartenmitte', job=null, data=null, layer=null, circle=null, hidden=new Set(), selId=null;
+let markLayer=null, center=null, label='Kartenmitte', job=null, data=null, layer=null, circle=null, hidden=new Set(), selId=null;
 let own={}; try{ own=JSON.parse(localStorage.getItem('asbest-own')||'{}'); }catch(e){}
 const saveOwn=()=>{ try{ localStorage.setItem('asbest-own',JSON.stringify(own)); }catch(e){} };
 const setStatus=t=>$('status').textContent=t;
@@ -182,6 +187,9 @@ function render(){
   const feats=data.features.filter(f=>!hidden.has(f.properties.stufe));
   layer=L.geoJSON({type:'FeatureCollection',features:feats},{style:f=>({color:C[f.properties.stufe]||C.unklar,weight:f.id===selId?4:2,fillOpacity:f.properties.stufe==='hoch'?.35:.18})
     ,onEachFeature:(f,l)=>l.on('click',()=>select(f.id,false))}).addTo(map);
+  if(markLayer) map.removeLayer(markLayer);
+  markLayer=L.layerGroup(feats.filter(f=>f.properties.markierung).map(f=>L.polygon(f.properties.markierung.map(p=>[p[1],p[0]]),
+    {color:f.properties.stufe==='hoch'?'#ffdc00':'#f09600',weight:3,dashArray:'6 4',fillOpacity:.45,interactive:false}))).addTo(map);
   const cnt={hoch:0,mittel:0,unklar:0,gering:0,fehler:0}; data.features.forEach(f=>cnt[f.properties.stufe]=(cnt[f.properties.stufe]||0)+1);
   $('counts').innerHTML=''; Object.keys(cnt).filter(k=>cnt[k]).forEach(k=>{ const s=document.createElement('span'); if(hidden.has(k)) s.className='off';
     s.innerHTML=`<i class="dot" style="background:${C[k]}"></i>${k} ${cnt[k]}`; s.onclick=()=>{hidden.has(k)?hidden.delete(k):hidden.add(k); render();}; $('counts').append(s); });
@@ -189,16 +197,19 @@ function render(){
   feats.slice().sort((a,b)=>ORDER[a.properties.stufe]-ORDER[b.properties.stufe]||a.properties.distanz_m-b.properties.distanz_m).forEach(f=>{
     const p=f.properties, el=document.createElement('div'); el.className='item'+(f.id===selId?' sel':''); el.id='it-'+f.id;
     const adr=[p.osm['addr:street'],p.osm['addr:housenumber']].filter(Boolean).join(' ');
-    el.innerHTML=`<img alt="Luftbild-Ausschnitt" loading="lazy" src="/api/img/${job}/${f.id}.jpg">
+    el.innerHTML=`<img alt="Luftbild-Ausschnitt" loading="lazy" data-big="1" src="/api/img/${job}/${f.id}.jpg">
       <div><h3><span class="pill" style="background:${C[p.stufe]||C.unklar}">${p.stufe}</span>${esc(p.dacheindeckung||adr||'Gebäude')}</h3>
       <p>${esc(p.begruendung||p.fehler||'')}</p>
       <div class="meta">${adr?esc(adr)+' · ':''}${p.flaeche_m2} m² · ${p.distanz_m} m${p.osm.building&&p.osm.building!=='yes'?' · '+esc(p.osm.building):''}${p.merkmale&&p.merkmale.length?' · '+esc(p.merkmale.join(', ')):''}</div>
       <div class="verdict">${['bestätigt','verworfen','vor Ort prüfen'].map(v=>`<button type="button" data-v="${v}" class="${own[f.id]===v?'on':''}">${v}</button>`).join('')}</div></div>`;
-    el.onclick=ev=>{ const v=ev.target.dataset&&ev.target.dataset.v; if(v){ own[f.id]=own[f.id]===v?undefined:v; saveOwn(); render(); return; } select(f.id,true); };
+    el.onclick=ev=>{ if(ev.target.dataset&&ev.target.dataset.big){ openBig(f); return; } const v=ev.target.dataset&&ev.target.dataset.v; if(v){ own[f.id]=own[f.id]===v?undefined:v; saveOwn(); render(); return; } select(f.id,true); };
     list.append(el);
   });
   $('expGeo').disabled=$('expCsv').disabled=false;
 }
+function openBig(f){ const p=f.properties, C=COLORS(); const d=document.createElement('div'); d.id='lb';
+  d.innerHTML=`<figure><img alt="Luftbild-Ausschnitt groß" src="/api/img/${job}/${f.id}.jpg"><figcaption><b>${esc(p.stufe)}</b> · ${esc(p.dacheindeckung||'')}<br>${esc(p.begruendung||p.fehler||'')}<br><span class="k" style="border:2px solid #ff2828"></span>Gebäude${p.markierung?`<span class="k" style="background:${p.stufe==="hoch"?"#ffdc00":"#f09600"}"></span>verdächtige Fläche`:''}</figcaption></figure>`;
+  d.onclick=()=>d.remove(); document.addEventListener('keydown',function k(e){ if(e.key==='Escape'){ d.remove(); document.removeEventListener('keydown',k);} }); document.body.append(d); }
 function select(id,zoom){ selId=id; const f=data.features.find(x=>x.id===id); render();
   if(zoom&&f) map.fitBounds(L.geoJSON(f).getBounds(),{maxZoom:21,padding:[60,60]});
   const el=$('it-'+id); if(el) el.scrollIntoView({block:'nearest'}); }

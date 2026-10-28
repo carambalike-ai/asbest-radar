@@ -103,6 +103,12 @@ def to_3857(lon, lat):
     return x, y
 
 
+def from_3857(x, y):
+    lon = math.degrees(x / R_EARTH)
+    lat = math.degrees(2 * math.atan(math.exp(y / R_EARTH)) - math.pi / 2)
+    return lon, lat
+
+
 def meters_per_unit(lat):
     """Web-Mercator streckt mit 1/cos(lat). Wahre Meter = Einheit * cos(lat)."""
     return math.cos(math.radians(lat))
@@ -160,24 +166,27 @@ def geocode(q):
 
 # ---------------------------------------------------------------- Gebäude (OSM)
 OVERPASS = [
+    "https://overpass.private.coffee/api/interpreter",
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
     "https://overpass-api.de/api/interpreter",
-    "https://overpass.kumi.systems/api/interpreter",
 ]
 
 
 def load_buildings(lat, lon, radius, limit):
-    q = f'[out:json][timeout:60];way["building"](around:{int(radius)},{lat},{lon});out tags geom;'
+    q = f'[out:json][timeout:25];way["building"](around:{int(radius)},{lat},{lon});out tags geom;'
     data = urllib.parse.urlencode({"data": q}).encode()
-    last = None
+    errors = []
     for url in OVERPASS:
         try:
-            raw, _ = http_get(url, timeout=90, data=data)
+            raw, _ = http_get(url, timeout=35, data=data)
             js = json.loads(raw)
+            print(f"Gebäude von {url.split('/')[2]}", flush=True)
             break
         except Exception as e:  # nächster Server
-            last = e
+            errors.append(f"{url.split('/')[2]}: {e}")
+            print("Overpass-Fehler", errors[-1], flush=True)
     else:
-        raise RuntimeError(f"Gebäudedaten nicht erreichbar ({last})")
+        raise RuntimeError("Gebäudedaten nicht erreichbar: " + " | ".join(errors))
 
     cx, cy = to_3857(lon, lat)
     items = []
@@ -275,7 +284,7 @@ def make_crop(b, lat, source_pref):
     d.line(pts + [pts[0]], fill=(255, 40, 40), width=max(2, w // 220))
     buf = io.BytesIO()
     img.save(buf, "JPEG", quality=88)
-    return buf.getvalue(), source
+    return buf.getvalue(), source, bbox
 
 
 # ------------------------------------------------------------------- KI-Analyse
@@ -291,8 +300,10 @@ Gegenindizien: Dachziegel (rot, braun, anthrazit, klar gegliederte Pfannenreihen
 
 Wichtig: Aus einem Luftbild ist Asbest NIE sicher feststellbar. Neue asbestfreie Faserzementplatten sehen ähnlich aus. Gib daher nur einen Verdachtsgrad an und sei ehrlich, wenn die Auflösung nicht reicht.
 
+Bei "hoch" oder "mittel" gib zusätzlich die verdächtige Dachfläche als Rechteck an: "bereich": [ymin, xmin, ymax, xmax], Werte 0 bis 1000 relativ zum jeweiligen Bild (0,0 = oben links). Das Rechteck soll nur die verdächtige Eindeckung umfassen, nicht das ganze Bild. Bei "gering" oder "unklar": "bereich": null.
+
 Antworte NUR mit einem JSON-Array, ein Objekt pro Bild, in derselben Reihenfolge:
-[{"bild": 1, "stufe": "hoch|mittel|gering|unklar", "dacheindeckung": "kurz, z.B. Wellplatten grau", "merkmale": ["...", "..."], "begruendung": "ein bis zwei Sätze"}]
+[{"bild": 1, "stufe": "hoch|mittel|gering|unklar", "dacheindeckung": "kurz, z.B. Wellplatten grau", "merkmale": ["...", "..."], "begruendung": "ein bis zwei Sätze", "bereich": [ymin, xmin, ymax, xmax] oder null}]
 """
 
 
@@ -400,8 +411,8 @@ def run_job(job_id, lat, lon, radius, limit, source_pref, label):
 
         def do_crop(b):
             try:
-                jpeg, src = make_crop(b, lat, source_pref)
-                crops[b["id"]] = (jpeg, src)
+                jpeg, src, bbox = make_crop(b, lat, source_pref)
+                crops[b["id"]] = (jpeg, src, bbox)
             except Exception as e:
                 b["error"] = str(e)[:300]
             with JOBS_LOCK:
@@ -436,6 +447,37 @@ def run_job(job_id, lat, lon, radius, limit, source_pref, label):
         with ThreadPoolExecutor(1 if PROVIDER == "gemini" else 2) as ex:
             list(ex.map(do_batch, batches))
 
+        # Verdächtige Fläche ins Bild zeichnen und als Kartenfläche umrechnen
+        colors = {"hoch": (255, 220, 0), "mittel": (240, 150, 0)}
+        for b in buildings:
+            ki = b.get("ki") or {}
+            area = ki.get("bereich")
+            if b["id"] not in crops or ki.get("stufe") not in colors:
+                continue
+            try:
+                ymin, xmin, ymax, xmax = [max(0.0, min(1000.0, float(v))) for v in area]
+                if ymax - ymin < 5 or xmax - xmin < 5:
+                    continue
+            except Exception:
+                continue
+            jpeg, src, (minx, miny, maxx, maxy) = crops[b["id"]]
+            img = Image.open(io.BytesIO(jpeg)).convert("RGB")
+            w, h = img.size
+            box = (xmin / 1000 * w, ymin / 1000 * h, xmax / 1000 * w, ymax / 1000 * h)
+            col = colors[ki["stufe"]]
+            overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+            od = ImageDraw.Draw(overlay)
+            od.rectangle(box, fill=col + (70,), outline=col + (255,), width=max(3, w // 150))
+            img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+            buf = io.BytesIO()
+            img.save(buf, "JPEG", quality=88)
+            job["images"][b["id"]] = buf.getvalue()
+            gx = lambda xv: minx + xv / 1000 * (maxx - minx)
+            gy = lambda yv: maxy - yv / 1000 * (maxy - miny)
+            ring = [from_3857(gx(xmin), gy(ymin)), from_3857(gx(xmax), gy(ymin)),
+                    from_3857(gx(xmax), gy(ymax)), from_3857(gx(xmin), gy(ymax))]
+            b["markierung"] = [[round(x, 7), round(y, 7)] for x, y in ring + [ring[0]]]
+
         feats = []
         for b in buildings:
             ki = b.get("ki") or {}
@@ -450,7 +492,8 @@ def run_job(job_id, lat, lon, radius, limit, source_pref, label):
                     "dacheindeckung": ki.get("dacheindeckung", ""),
                     "merkmale": ki.get("merkmale", []),
                     "begruendung": ki.get("begruendung", ""),
-                    "bildquelle": crops.get(b["id"], (None, ""))[1],
+                    "bildquelle": crops.get(b["id"], (None, "", None))[1],
+                    "markierung": b.get("markierung"),
                     "fehler": b.get("error", ""),
                 },
             })
@@ -465,6 +508,7 @@ def run_job(job_id, lat, lon, radius, limit, source_pref, label):
             json.dump(fc, f, ensure_ascii=False, indent=1)
         upd(phase="fertig", done=True, result=fc, saved=path)
     except Exception as e:
+        print("Auftrag fehlgeschlagen:", e, flush=True)
         upd(phase="Fehler", done=True, error=str(e)[:500])
 
 
