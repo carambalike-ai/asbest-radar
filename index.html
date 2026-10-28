@@ -178,8 +178,12 @@ async function poll(){
   if(j.error){ setStatus('Fehler: '+j.error); return; }
   if(!j.result){ setStatus('Keine Gebäude im Umkreis gefunden.'); return; }
   $('prog').style.width='100%';
-  setStatus(`Fertig in ${secs}s · ${t} Dächer · gespeichert in ${j.saved}`);
+  const m=j.result.meta||{};
+  if(m.modus==='kachel'){
+    setStatus(`Fertig in ${secs}s · Kachel-Suche (keine Gebäudedaten verfügbar) · ${m.kacheln} Kacheln à 80 m durchsucht · ${j.result.features.length} Verdachtsflächen`+(m.kachel_fehler?` · ${m.kachel_fehler} Kacheln mit Fehler`:''));
+  } else setStatus(`Fertig in ${secs}s · ${t} Dächer`);
   data=j.result; render();
+  if(!data.features.length) $('list').innerHTML='<div class="empty">Keine verdächtigen Dächer gefunden.</div>';
 }
 
 function render(){

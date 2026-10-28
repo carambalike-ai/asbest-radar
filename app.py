@@ -178,7 +178,7 @@ def load_buildings(lat, lon, radius, limit):
     errors = []
     for url in OVERPASS:
         try:
-            raw, _ = http_get(url, timeout=35, data=data)
+            raw, _ = http_get(url, timeout=20, data=data)
             js = json.loads(raw)
             print(f"Gebäude von {url.split('/')[2]}", flush=True)
             break
@@ -314,11 +314,10 @@ def parse_json_array(text):
     return json.loads(m.group(0))
 
 
-def call_gemini(batch):
-    parts = [{"text": PROMPT}]
-    for i, (b, jpeg) in enumerate(batch, 1):
-        info = ", ".join(f"{k}={v}" for k, v in b["tags"].items()) or "keine Zusatzangaben"
-        parts.append({"text": f"Bild {i}: Grundfläche ca. {b['area']} m². OSM-Angaben: {info}"})
+def call_gemini(prompt, items):
+    parts = [{"text": prompt}]
+    for text, jpeg in items:
+        parts.append({"text": text})
         parts.append({"inline_data": {"mime_type": "image/jpeg",
                                       "data": base64.b64encode(jpeg).decode()}})
     body = json.dumps({
@@ -351,17 +350,22 @@ def call_gemini(batch):
     return parse_json_array(text)
 
 
+def ai_request(prompt, items):
+    return call_gemini(prompt, items) if PROVIDER == "gemini" else call_claude(prompt, items)
+
+
 def call_ai(batch):
-    return call_gemini(batch) if PROVIDER == "gemini" else call_claude(batch)
-
-
-def call_claude(batch):
-    content = [{"type": "text", "text": PROMPT}]
+    items = []
     for i, (b, jpeg) in enumerate(batch, 1):
-        t = b["tags"]
-        info = ", ".join(f"{k}={v}" for k, v in t.items()) or "keine Zusatzangaben"
-        content.append({"type": "text",
-                        "text": f"Bild {i}: Grundfläche ca. {b['area']} m². OSM-Angaben: {info}"})
+        info = ", ".join(f"{k}={v}" for k, v in b["tags"].items()) or "keine Zusatzangaben"
+        items.append((f"Bild {i}: Grundfläche ca. {b['area']} m². OSM-Angaben: {info}", jpeg))
+    return ai_request(PROMPT, items)
+
+
+def call_claude(prompt, items):
+    content = [{"type": "text", "text": prompt}]
+    for text, jpeg in items:
+        content.append({"type": "text", "text": text})
         content.append({"type": "image", "source": {
             "type": "base64", "media_type": "image/jpeg",
             "data": base64.b64encode(jpeg).decode()}})
@@ -390,6 +394,132 @@ def call_claude(batch):
     return json.loads(m.group(0))
 
 
+# ------------------------------------------------------------- Kachel-Suche
+GRID_PROMPT = """Du bekommst senkrechte Luftbild-Kacheln (Orthofotos, ca. 80 x 80 m, Vorarlberg, Österreich). Suche in jeder Kachel ALLE Dächer, die verdächtig auf asbesthaltige Eindeckung (Asbestzement, "Eternit") aussehen.
+
+Hintergrund: In Österreich ist Asbest seit 1990 verboten, Asbestzement für Dächer seit 1.1.1994 nicht mehr in Verkehr gebracht. Verdachtsmerkmale:
+- Wellplatten mit gleichmäßiger paralleler Rillenstruktur (oft Scheunen, Ställe, Garagen, Werkhallen, Schuppen, Carports)
+- grau bis grau-braun verwittert, fleckig, Moos- oder Flechtenbewuchs, dunkle Ablaufspuren
+- kleinformatige graue Faserzement-Schindeln (rautenförmig oder rechteckig), verwittert
+Kein Verdacht: Dachziegel (rot, braun, anthrazit, klare Pfannenreihen), Blech mit Stehfalz, vollflächige Photovoltaik, Gründach, Kies-Flachdach, sichtbar neue Eindeckung.
+
+Aus Luftbildern ist Asbest nie sicher feststellbar. Melde nur echte Verdachtsfälle mit "stufe" "hoch" oder "mittel". Keine Funde ist eine gültige Antwort.
+
+Für jeden Fund: "box": [ymin, xmin, ymax, xmax] mit Werten 0 bis 1000 relativ zur Kachel (0,0 = oben links), eng um die verdächtige Dachfläche.
+
+Antworte NUR mit einem JSON-Array, ein Objekt pro Kachel in derselben Reihenfolge:
+[{"bild": 1, "funde": [{"box": [ymin, xmin, ymax, xmax], "stufe": "hoch|mittel", "dacheindeckung": "kurz", "merkmale": ["..."], "begruendung": "ein Satz"}]}]
+"""
+
+GRID_TILE_M = 80
+GRID_BATCH = 4
+
+
+def run_grid(job, upd, lat, lon, radius, source_pref):
+    cx, cy = to_3857(lon, lat)
+    mpu = meters_per_unit(lat)
+    side = GRID_TILE_M / mpu
+    n = max(1, math.ceil(2 * radius / GRID_TILE_M))
+    tiles = []
+    for i in range(n):
+        for j in range(n):
+            tx = cx - radius / mpu + (i + 0.5) * side
+            ty = cy - radius / mpu + (j + 0.5) * side
+            d = math.hypot(tx - cx, ty - cy) * mpu
+            if d <= radius + GRID_TILE_M * 0.5:
+                tiles.append({"id": f"k{i}_{j}", "dist": d,
+                              "bbox": (tx - side / 2, ty - side / 2, tx + side / 2, ty + side / 2)})
+    tiles.sort(key=lambda t: t["dist"])
+    tiles = tiles[:80]
+    upd(phase="Luftbild-Kacheln laden", total=len(tiles), total_found=len(tiles))
+
+    def do_crop(t):
+        for s_ in (["vogis", "basemap"] if source_pref != "basemap" else ["basemap", "vogis"]):
+            try:
+                img = crop_from_wms(t["bbox"]) if s_ == "vogis" else crop_from_basemap(t["bbox"])
+                buf = io.BytesIO()
+                img.save(buf, "JPEG", quality=88)
+                t["jpeg"], t["src"] = buf.getvalue(), s_
+                break
+            except Exception as e:
+                t["error"] = f"{s_}: {e}"[:200]
+        with JOBS_LOCK:
+            job["cropped"] += 1
+
+    with ThreadPoolExecutor(4) as ex:
+        list(ex.map(do_crop, tiles))
+    ok = [t for t in tiles if "jpeg" in t]
+    if not ok:
+        raise RuntimeError("Keine Luftbild-Kachel ladbar: " + (tiles[0].get("error") or ""))
+
+    upd(phase="KI durchsucht Kacheln")
+    finds = []
+    images = job.setdefault("images", {})
+    batches = [ok[i:i + GRID_BATCH] for i in range(0, len(ok), GRID_BATCH)]
+
+    def do_batch(ts):
+        try:
+            res = ai_request(GRID_PROMPT, [(f"Bild {k}:", t["jpeg"]) for k, t in enumerate(ts, 1)])
+            for k, t in enumerate(ts, 1):
+                r = next((x for x in res if isinstance(x, dict) and int(x.get("bild", -1)) == k), None)
+                if r is None and len(res) == len(ts) and isinstance(res[k - 1], dict):
+                    r = res[k - 1]
+                for m, f in enumerate((r or {}).get("funde") or []):
+                    if f.get("stufe") not in ("hoch", "mittel"):
+                        continue
+                    try:
+                        ymin, xmin, ymax, xmax = [max(0.0, min(1000.0, float(v))) for v in f["box"]]
+                    except Exception:
+                        continue
+                    if ymax - ymin < 5 or xmax - xmin < 5:
+                        continue
+                    finds.append((t, m, f, (ymin, xmin, ymax, xmax)))
+        except Exception as e:
+            print("Kachel-Fehler:", e, flush=True)
+            for t in ts:
+                t["error"] = str(e)[:300]
+        with JOBS_LOCK:
+            job["analyzed"] += len(ts)
+
+    with ThreadPoolExecutor(1 if PROVIDER == "gemini" else 2) as ex:
+        list(ex.map(do_batch, batches))
+
+    colors = {"hoch": (255, 220, 0), "mittel": (240, 150, 0)}
+    feats = []
+    for t, m, f, (ymin, xmin, ymax, xmax) in finds:
+        minx, miny, maxx, maxy = t["bbox"]
+        img = Image.open(io.BytesIO(t["jpeg"])).convert("RGB")
+        w, h = img.size
+        col = colors[f["stufe"]]
+        ov = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        ImageDraw.Draw(ov).rectangle((xmin / 1000 * w, ymin / 1000 * h, xmax / 1000 * w, ymax / 1000 * h),
+                                     fill=col + (70,), outline=col + (255,), width=max(3, w // 150))
+        img = Image.alpha_composite(img.convert("RGBA"), ov).convert("RGB")
+        buf = io.BytesIO()
+        img.save(buf, "JPEG", quality=88)
+        fid = f"{t['id']}_{m}"
+        images[fid] = buf.getvalue()
+        gx = lambda v: minx + v / 1000 * (maxx - minx)
+        gy = lambda v: maxy - v / 1000 * (maxy - miny)
+        ring = [from_3857(gx(xmin), gy(ymin)), from_3857(gx(xmax), gy(ymin)),
+                from_3857(gx(xmax), gy(ymax)), from_3857(gx(xmin), gy(ymax))]
+        ring = [[round(x, 7), round(y, 7)] for x, y in ring]
+        ring.append(ring[0])
+        area = (xmax - xmin) / 1000 * GRID_TILE_M * (ymax - ymin) / 1000 * GRID_TILE_M
+        mx = (gx(xmin) + gx(xmax)) / 2
+        my = (gy(ymin) + gy(ymax)) / 2
+        feats.append({"type": "Feature", "id": fid,
+                      "geometry": {"type": "Polygon", "coordinates": [ring]},
+                      "properties": {"id": fid, "osm_id": "", "flaeche_m2": round(area),
+                                     "distanz_m": round(math.hypot(mx - cx, my - cy) * mpu), "osm": {},
+                                     "stufe": f["stufe"], "dacheindeckung": f.get("dacheindeckung", ""),
+                                     "merkmale": f.get("merkmale", []), "begruendung": f.get("begruendung", ""),
+                                     "bildquelle": t["src"], "fehler": "", "markierung": ring,
+                                     "modus": "kachel"}})
+    errs = [t for t in tiles if t.get("error")]
+    return feats, len(ok), len(errs)
+
+
 # ----------------------------------------------------------------------- Job
 def run_job(job_id, lat, lon, radius, limit, source_pref, label):
     job = JOBS[job_id]
@@ -400,7 +530,18 @@ def run_job(job_id, lat, lon, radius, limit, source_pref, label):
 
     try:
         upd(phase="Gebäude laden")
-        buildings, total = load_buildings(lat, lon, radius, limit)
+        try:
+            buildings, total = load_buildings(lat, lon, radius, limit)
+        except Exception as e:
+            print("Wechsel auf Kachel-Suche:", e, flush=True)
+            feats, n_ok, n_err = run_grid(job, upd, lat, lon, radius, source_pref)
+            fc = {"type": "FeatureCollection", "features": feats,
+                  "meta": {"ort": label, "lat": lat, "lon": lon, "radius_m": radius, "modus": "kachel",
+                           "kacheln": n_ok, "kachel_fehler": n_err,
+                           "modell": f"{PROVIDER}:{MODEL}", "erstellt": datetime.now().isoformat(timespec="seconds"),
+                           "hinweis": "KI-Vorauswahl aus Luftbildern. Kein Nachweis von Asbest."}}
+            upd(phase="fertig", done=True, result=fc, saved="", mode="kachel")
+            return
         upd(total_found=total, total=len(buildings))
         if not buildings:
             upd(phase="fertig", done=True)
@@ -569,7 +710,7 @@ class H(BaseHTTPRequestHandler):
             with JOBS_LOCK:
                 view = {k: v for k, v in job.items() if k != "images"}
             return self.send(200, view)
-        m = re.match(r"^/api/img/([0-9a-f-]+)/(w\d+)\.jpg$", u.path)
+        m = re.match(r"^/api/img/([0-9a-f-]+)/([wk][\w]+)\.jpg$", u.path)
         if m:
             img = JOBS.get(m.group(1), {}).get("images", {}).get(m.group(2))
             if img:
