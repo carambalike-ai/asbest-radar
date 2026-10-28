@@ -418,6 +418,7 @@ def parse_json_array(text):
 
 
 GEMINI_DEAD = {}          # Modell -> Zeitpunkt, ab dem es heute nicht mehr geht
+GEMINI_429 = {}           # Modell -> 429 in Folge
 GEMINI_CANDS = []         # verfügbare Gratis-Modelle laut Google, beste zuerst
 SKIP_WORDS = ("tts", "image", "live", "audio", "embed", "robotics", "computer-use", "native", "learnlm")
 
@@ -490,10 +491,17 @@ def call_gemini(prompt, items):
             GEMINI_LAST[0] = time.time()
         try:
             raw, _ = http_get(url, timeout=180, data=body, headers=headers)
+            GEMINI_429[model] = 0
             break
         except urllib.error.HTTPError as e:
             msg = e.read().decode("utf8", "replace")[:1500]
-            daily = e.code == 429 and re.search(r"(?i)per ?day|PerDay|daily", msg)
+            q = re.search(r"Quota exceeded for metric: ([^\\\n\"]+)", msg)
+            print(f"Gemini {model}: HTTP {e.code} {q.group(1)[:200] if q else msg[:160]!r}", flush=True)
+            if e.code == 429:
+                GEMINI_429[model] = GEMINI_429.get(model, 0) + 1
+            # Tageslimit, Limit 0 (gratis nicht freigeschaltet) oder zweimal hintereinander 429: weiter zum nächsten Modell
+            daily = e.code == 429 and (re.search(r"(?i)per ?day|PerDay|daily|limit: 0\b", msg)
+                                       or GEMINI_429.get(model, 0) >= 2)
             if e.code in (400, 403, 404) or daily:
                 why = "Tageskontingent aufgebraucht" if daily else f"nicht nutzbar ({e.code})"
                 if GEMINI_ACTIVE[0] == model and next_gemini_model(why):
@@ -501,10 +509,10 @@ def call_gemini(prompt, items):
                 if GEMINI_ACTIVE[0] != model:
                     continue
                 if daily:
-                    raise RuntimeError("Das Gratis-Kontingent von Google ist für heute bei allen Modellen "
-                                       "aufgebraucht. Es setzt sich um ca. 9 Uhr früh zurück.")
+                    raise RuntimeError("Das Gratis-Kontingent von Google ist bei allen Modellen aufgebraucht. "
+                                       "Das Tageslimit setzt sich um ca. 9 Uhr früh zurück.")
             if e.code in (429, 500, 503) and attempt < 8:
-                time.sleep(15 * (1 + attempt % 3))
+                time.sleep(12)
                 continue
             raise RuntimeError(f"Gemini Fehler {e.code}: {msg[:600]}")
     else:
