@@ -79,7 +79,7 @@ PROVIDER = "gemini" if GEMINI_KEY else "claude"
 MODEL = GEMINI_MODEL if PROVIDER == "gemini" else os.environ.get("ASBEST_MODEL", "claude-sonnet-5-5")
 GEMINI_LOCK = threading.Lock()
 GEMINI_LAST = [0.0]
-BATCH = 6            # Dächer pro KI-Anfrage
+BATCH = 10           # Dächer pro KI-Anfrage
 CROP_MAX_PX = 768    # max. Kantenlänge eines Dachausschnitts
 UA = "Asbest-Radar-Vorarlberg/1.0 (private Nutzung)"
 OUT_DIR = os.path.join(HERE, "ergebnisse")
@@ -417,20 +417,71 @@ def parse_json_array(text):
     return json.loads(m.group(0))
 
 
+GEMINI_DEAD = {}          # Modell -> Zeitpunkt, ab dem es heute nicht mehr geht
+GEMINI_CANDS = []         # verfügbare Gratis-Modelle laut Google, beste zuerst
+SKIP_WORDS = ("tts", "image", "live", "audio", "embed", "robotics", "computer-use", "native", "learnlm")
+
+
+def gemini_candidates():
+    """Fragt einmal bei Google ab, welche Modelle dieser Schlüssel nutzen darf."""
+    if GEMINI_CANDS:
+        return GEMINI_CANDS
+    names = []
+    try:
+        raw, _ = http_get("https://generativelanguage.googleapis.com/v1beta/models?pageSize=200",
+                          timeout=20, headers={"x-goog-api-key": GEMINI_KEY})
+        for m in json.loads(raw).get("models", []):
+            n = m.get("name", "").replace("models/", "")
+            if "generateContent" not in m.get("supportedGenerationMethods", []):
+                continue
+            if any(w in n for w in SKIP_WORDS):
+                continue
+            if ("gemini" in n and "flash" in n) or (n.startswith("gemma-") and n.endswith("-it")):
+                names.append(n)
+    except Exception as e:
+        print("Modell-Liste nicht abrufbar:", e, flush=True)
+
+    def rank(n):
+        ver = [float(x) for x in re.findall(r"(\d+(?:\.\d+)?)", n)[:1]] or [0.0]
+        return (n.startswith("gemma"),            # Gemini vor Gemma
+                "preview" in n or "exp" in n,      # stabile vor Vorschau
+                "lite" in n,                       # volle vor lite
+                -ver[0],                           # neuere zuerst
+                n)
+    names.sort(key=rank)
+    if GEMINI_MODEL in names:
+        names.remove(GEMINI_MODEL)
+    GEMINI_CANDS[:] = [GEMINI_MODEL] + names
+    print("Gemini-Modelle in Reserve:", ", ".join(GEMINI_CANDS), flush=True)
+    return GEMINI_CANDS
+
+
+def next_gemini_model(reason):
+    GEMINI_DEAD[GEMINI_ACTIVE[0]] = time.time()
+    for n in gemini_candidates():
+        t = GEMINI_DEAD.get(n)
+        if t is None or time.time() - t > 6 * 3600:
+            print(f"Gemini: {GEMINI_ACTIVE[0]} {reason}, wechsle auf {n}", flush=True)
+            GEMINI_ACTIVE[0] = n
+            return True
+    return False
+
+
 def call_gemini(prompt, items):
     parts = [{"text": prompt}]
     for text, jpeg in items:
         parts.append({"text": text})
         parts.append({"inline_data": {"mime_type": "image/jpeg",
                                       "data": base64.b64encode(jpeg).decode()}})
-    body = json.dumps({
-        "contents": [{"role": "user", "parts": parts}],
-        "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"},
-    }).encode()
     headers = {"x-goog-api-key": GEMINI_KEY, "content-type": "application/json"}
-    tried = set()
-    for attempt in range(6):
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_ACTIVE[0]}:generateContent"
+    for attempt in range(12):
+        model = GEMINI_ACTIVE[0]
+        cfg = {"temperature": 0.2}
+        if not model.startswith("gemma"):
+            cfg["responseMimeType"] = "application/json"   # Gemma kennt den JSON-Modus nicht
+        body = json.dumps({"contents": [{"role": "user", "parts": parts}],
+                           "generationConfig": cfg}).encode()
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         # Gratis-Kontingent: höchstens ca. 1 Anfrage alle 7 Sekunden
         with GEMINI_LOCK:
             wait = 7 - (time.time() - GEMINI_LAST[0])
@@ -441,21 +492,23 @@ def call_gemini(prompt, items):
             raw, _ = http_get(url, timeout=180, data=body, headers=headers)
             break
         except urllib.error.HTTPError as e:
-            msg = e.read().decode("utf8", "replace")[:800]
-            if e.code == 404:
-                tried.add(GEMINI_ACTIVE[0])
-                m = re.search(r"models/(gemini[\w.\-]+)", msg.split("use", 1)[-1])
-                cand = [m.group(1)] if m else []
-                cand += ["gemini-flash-latest", "gemini-3.8-flash"]
-                nxt = next((c for c in cand if c not in tried), None)
-                if nxt:
-                    print(f"Gemini-Modell {GEMINI_ACTIVE[0]} nicht verfügbar, wechsle auf {nxt}", flush=True)
-                    GEMINI_ACTIVE[0] = nxt
+            msg = e.read().decode("utf8", "replace")[:1500]
+            daily = e.code == 429 and re.search(r"(?i)per ?day|PerDay|daily", msg)
+            if e.code in (400, 403, 404) or daily:
+                why = "Tageskontingent aufgebraucht" if daily else f"nicht nutzbar ({e.code})"
+                if GEMINI_ACTIVE[0] == model and next_gemini_model(why):
                     continue
-            if e.code in (429, 500, 503) and attempt < 4:
-                time.sleep(20 * (attempt + 1))
+                if GEMINI_ACTIVE[0] != model:
+                    continue
+                if daily:
+                    raise RuntimeError("Das Gratis-Kontingent von Google ist für heute bei allen Modellen "
+                                       "aufgebraucht. Es setzt sich um ca. 9 Uhr früh zurück.")
+            if e.code in (429, 500, 503) and attempt < 8:
+                time.sleep(15 * (1 + attempt % 3))
                 continue
-            raise RuntimeError(f"Gemini Fehler {e.code}: {msg}")
+            raise RuntimeError(f"Gemini Fehler {e.code}: {msg[:600]}")
+    else:
+        raise RuntimeError("Gemini antwortet nicht. Bitte später nochmal.")
     js = json.loads(raw)
     cands = js.get("candidates") or []
     if not cands:
@@ -526,7 +579,7 @@ Antworte NUR mit einem JSON-Array, ein Objekt pro Kachel in derselben Reihenfolg
 """
 
 GRID_TILE_M = 80
-GRID_BATCH = 4
+GRID_BATCH = 10
 
 
 GRID_MAX = 80
@@ -631,6 +684,8 @@ def run_grid(job, upd, lat, lon, tiles, source_pref):
 
     with ThreadPoolExecutor(1 if PROVIDER == "gemini" else 2) as ex:
         list(ex.map(do_batch, batches))
+    if ok and all(t.get("error") for t in ok):
+        raise RuntimeError(ok[0]["error"])
 
     colors = {"hoch": (255, 220, 0), "mittel": (240, 150, 0)}
     feats = []
@@ -745,6 +800,8 @@ def run_job(job_id, lat, lon, radius, limit, source_pref, label, bbox=None):
 
         with ThreadPoolExecutor(1 if PROVIDER == "gemini" else 2) as ex:
             list(ex.map(do_batch, batches))
+        if all(b.get("error") for b in ok):
+            raise RuntimeError(ok[0]["error"])
 
         # Verdächtige Fläche ins Bild zeichnen und als Kartenfläche umrechnen
         colors = {"hoch": (255, 220, 0), "mittel": (240, 150, 0)}
